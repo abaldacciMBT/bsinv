@@ -1,16 +1,17 @@
+import os
+import re
+import json
+from datetime import datetime
+
 import streamlit as st
 import pdfplumber
 import pytesseract
 from PIL import Image
-import openai
 import pandas as pd
-import os
 import requests
 from bs4 import BeautifulSoup
-import json
-import re
-from datetime import datetime
 
+# -------------- Streamlit Page Setup --------------
 st.set_page_config(
     page_title="Invoice Tariff Workbench",
     layout="wide",
@@ -27,20 +28,13 @@ st.markdown(
         --muted-text: #5A6C7D;
         --panel-border: #C6D3E0;
     }
-
     body, .stApp {
         background-color: var(--soft-blue);
         color: var(--text-dark);
         font-family: "Inter", "Segoe UI", sans-serif;
     }
-
     .stApp header {display:none;}
-
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2.5rem;
-    }
-
+    .block-container { padding-top: 1.5rem; padding-bottom: 2.5rem; }
     .invoice-card {
         background: white;
         border-radius: 14px;
@@ -49,7 +43,6 @@ st.markdown(
         box-shadow: 0 12px 24px rgba(15, 76, 129, 0.06);
         margin-bottom: 1.5rem;
     }
-
     .info-note {
         background: rgba(15, 76, 129, 0.07);
         border-left: 4px solid var(--primary-blue);
@@ -59,7 +52,6 @@ st.markdown(
         margin-bottom: 1.25rem;
         font-size: 0.95rem;
     }
-
     .metric-card {
         background: white;
         border: 1px solid var(--panel-border);
@@ -68,26 +60,6 @@ st.markdown(
         text-align: left;
         height: 100%;
     }
-
-    .metric-card h3 {
-        margin: 0;
-        color: var(--muted-text);
-        font-size: 0.85rem;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-    }
-
-    .metric-card p {
-        margin: 0.25rem 0 0;
-        font-size: 1.4rem;
-        font-weight: 600;
-        color: var(--primary-blue);
-    }
-
-    div[data-testid="stMetricValue"] {
-        color: var(--primary-blue) !important;
-    }
-
     .save-banner {
         background: rgba(12, 30, 52, 0.92);
         color: white;
@@ -103,83 +75,124 @@ st.markdown(
 st.title("Invoice Tariff Workbench")
 st.caption("Internal customs operations tool for Bahamian imports")
 
-# Set your OpenAI API key (from environment variable or .streamlit/secrets.toml)
-openai_api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("openai_api_key", ""))
-if not openai_api_key:
-    st.error("Please set your OpenAI API key as an environment variable (OPENAI_API_KEY).")
+# -------------- OpenAI Client / Secrets --------------
+api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("openai_api_key", ""))
+if not api_key:
+    st.error("Set your OpenAI key as env var OPENAI_API_KEY or in Streamlit secrets as `openai_api_key`.")
     st.stop()
-openai.api_key = openai_api_key
 
-def extract_text_with_ocr(uploaded_file):
+try:
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+except Exception as e:
+    st.error(f"OpenAI client import/init failed: {e}")
+    st.stop()
+
+# -------------- Helpers --------------
+def extract_text_with_ocr(uploaded_file) -> str:
+    """
+    Extract text from a PDF; if a page has little/no text, OCR it.
+    """
     all_text = ""
     with pdfplumber.open(uploaded_file) as pdf:
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            if text and len(text.strip()) > 30:
+        for i, page in enumerate(pdf.pages, start=1):
+            try:
+                text = page.extract_text() or ""
+            except Exception as e:
+                text = ""
+
+            if text.strip() and len(text.strip()) > 30:
                 all_text += text + "\n"
-            else:
-                st.warning(f"Page {i+1} had little or no text. Using OCR.")
-                pil_image = page.to_image(resolution=300).original
-                ocr_text = pytesseract.image_to_string(pil_image)
+                continue
+
+            # Fallback to OCR
+            st.warning(f"Page {i} had little/no selectable text. Using OCR.")
+            try:
+                # Render page raster for OCR; to_image may require wand/ImageMagick
+                pil_img = page.to_image(resolution=300).original  # may raise if wand/imagemagick missing
+                ocr_text = pytesseract.image_to_string(pil_img) or ""
                 all_text += ocr_text + "\n"
+            except Exception as e:
+                st.error(
+                    f"OCR render failed on page {i}. Ensure ImageMagick/Wand is installed. Error: {e}"
+                )
     return all_text
 
-def ai_extract_invoice_data(pdf_text):
-    prompt = f"""Extract the following from this invoice text:
-    - Invoice Number
-    - Invoice Date
-    - Vendor
-    - For each line item: item/manufacturer part number, description, brand, quantity, price, extended price.
-    Present as a JSON list of line items, and include invoice number and date for each item.
-    Text: {pdf_text}
+def ai_extract_invoice_data(pdf_text: str) -> str:
     """
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": "You are an expert at understanding invoices."},
-                  {"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
-
-def ai_predict_hts(description, part_number):
-    prompt = f"""Given the following item description and part number, predict the most likely 6-digit HTS (Harmonized Tariff Schedule) code for US import, based on standard customs practices. Give ONLY the 6-digit code.
-    Description: {description}
-    Part Number: {part_number}
+    Ask the model to extract invoice header + line items and return JSON (as text).
     """
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "system", "content": "You are a customs tariff specialist."},
-                  {"role": "user", "content": prompt}]
+    prompt = (
+        "Extract the following from this invoice text:\n"
+        "- Invoice Number\n"
+        "- Invoice Date\n"
+        "- Vendor\n"
+        "- For each line item: item/manufacturer part number, description, brand, quantity, price, extended price.\n"
+        "Return ONLY a JSON array of line item objects. Each object must include the invoice number and invoice date.\n"
+        "If a field is unknown, set it to an empty string.\n\n"
+        f"Text:\n{pdf_text}"
     )
-    raw = response.choices[0].message.content.strip()
-    code_match = re.search(r"\b\d{6,10}\b", raw)
-    if code_match:
-        return code_match.group(0)[:6]
-    return raw.split()[0]
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are an expert at understanding invoices and producing strict JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0
+    )
+    return resp.choices[0].message.content or ""
 
-def get_bahamas_tariff(hts_code):
+def ai_predict_hts(description: str, part_number: str) -> str:
+    """
+    Ask the model for the likely 6-digit HTS code. Returns 6 digits when possible.
+    """
+    prompt = (
+        "Given the following item description and part number, predict the most likely 6-digit HTS "
+        "(Harmonized Tariff Schedule) code for US import, based on standard customs practices. "
+        "Respond with ONLY the 6-digit code (no words).\n\n"
+        f"Description: {description}\n"
+        f"Part Number: {part_number}"
+    )
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a customs tariff specialist."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    m = re.search(r"\b\d{6,10}\b", raw)
+    return m.group(0)[:6] if m else (raw[:6] if raw and raw[:6].isdigit() else "")
+
+def get_bahamas_tariff(hts_code: str) -> str:
+    """
+    Scrape Bahamas Customs search page for the code row.
+    """
+    if not hts_code:
+        return "No HTS code predicted"
     url = f'https://www.bahamascustoms.gov.bs/tariffs-and-various-taxes-collected-by-customs/tariff-search/?q={hts_code}'
     try:
         resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         table = soup.find('table')
-        if table:
-            rows = table.find_all('tr')
-            # Take the first non-header row
-            for r in rows[1:]:
-                columns = [c.get_text(strip=True) for c in r.find_all(['td', 'th'])]
-                if columns and hts_code[:6] in columns[0]:
-                    return " | ".join(columns)
-            return "Result table found, but HTS code row missing"
-        return "No result table found"
+        if not table:
+            return "No result table found"
+        rows = table.find_all('tr')
+        for r in rows[1:]:
+            cols = [c.get_text(strip=True) for c in r.find_all(['td', 'th'])]
+            if cols and hts_code[:6] in (cols[0] or ""):
+                return " | ".join(cols)
+        return "Result table found, but HTS code row missing"
     except Exception as e:
         return f"Error: {str(e)}"
 
 EXCEL_LOG_PATH = os.path.join("data", "invoice_tariff_log.xlsx")
-
 if "save_confirmed" not in st.session_state:
     st.session_state.save_confirmed = False
     st.session_state.last_saved = None
-
+    st.session_state.latest_log = None
 
 def append_to_excel_log(df: pd.DataFrame, path: str) -> pd.DataFrame:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -191,7 +204,7 @@ def append_to_excel_log(df: pd.DataFrame, path: str) -> pd.DataFrame:
     combined.to_excel(path, index=False)
     return combined
 
-
+# -------------- UI: Upload --------------
 with st.container():
     st.markdown("<div class='invoice-card'>", unsafe_allow_html=True)
     st.subheader("1. Upload & Index the Supplier Invoice")
@@ -207,11 +220,14 @@ with st.container():
     uploaded_file = st.file_uploader("Select invoice PDF", type="pdf", label_visibility="collapsed")
     st.markdown("</div>", unsafe_allow_html=True)
 
+# -------------- Processing --------------
 if uploaded_file:
     with st.spinner("Extracting text (using OCR if needed)..."):
         pdf_text = extract_text_with_ocr(uploaded_file)
+
     with st.expander("Preview extracted text", expanded=False):
-        st.write(pdf_text[:2000] + ("..." if len(pdf_text) > 2000 else ""))
+        preview = (pdf_text or "")
+        st.write(preview[:2000] + ("..." if len(preview) > 2000 else ""))
 
     st.markdown(
         """
@@ -228,34 +244,49 @@ if uploaded_file:
 
     st.info("Extracting line items and invoice fields using AI (GPT-4o)...")
     invoice_data_json = ai_extract_invoice_data(pdf_text)
-    try:
-        # Some AI responses might have trailing text, try to parse JSON robustly
-        data_start = invoice_data_json.find("[")
-        data_end = invoice_data_json.rfind("]") + 1
-        line_items = json.loads(invoice_data_json[data_start:data_end])
-    except Exception as e:
-        st.error("AI extraction did not return clean JSON, please check the prompt or manually correct.")
-        st.write(invoice_data_json)
-        line_items = []
 
-    summary = []
+    # Try to parse a JSON array anywhere in the response
+    line_items = []
+    try:
+        start = invoice_data_json.find("[")
+        end = invoice_data_json.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            line_items = json.loads(invoice_data_json[start : end + 1])
+        else:
+            # If model returned object with a key, try to extract 'items' or similar
+            obj = json.loads(invoice_data_json)
+            if isinstance(obj, dict):
+                # pick first array value
+                for v in obj.values():
+                    if isinstance(v, list):
+                        line_items = v
+                        break
+    except Exception:
+        st.error("AI extraction did not return clean JSON. Displaying raw model output below for troubleshooting.")
+        st.code(invoice_data_json)
+
+    summary_rows = []
     invoice_number_tracker = {}
     for item in line_items:
-        desc = item.get("description", "")
-        part = item.get("item/manufacturer part number", "")
-        brand = item.get("brand", "")
-        qty = item.get("quantity", "")
-        price = item.get("price", "")
-        ext_price = item.get("extended price", "")
-        invoice_number = item.get("invoice number", item.get("invoice", ""))
-        invoice_date = item.get("invoice date", "")
-        invoice_key = (invoice_number, invoice_date)
-        invoice_number_tracker.setdefault(invoice_key, 0)
-        invoice_number_tracker[invoice_key] += 1
-        line_index = invoice_number_tracker[invoice_key]
-        hts_code = ai_predict_hts(desc, part)
+        # Normalize keys; model outputs can vary slightly
+        desc = item.get("description", item.get("Description", ""))
+        part = item.get("item/manufacturer part number", item.get("part_number", item.get("Part Number", "")))
+        brand = item.get("brand", item.get("Brand", ""))
+        qty = item.get("quantity", item.get("Quantity", ""))
+        price = item.get("price", item.get("Price", ""))
+        ext_price = item.get("extended price", item.get("extended_price", item.get("Ext. Price", "")))
+        invoice_number = item.get("invoice number", item.get("invoice", item.get("Invoice", "")))
+        invoice_date = item.get("invoice date", item.get("Invoice Date", ""))
+
+        key = (invoice_number, invoice_date)
+        invoice_number_tracker.setdefault(key, 0)
+        invoice_number_tracker[key] += 1
+        line_index = invoice_number_tracker[key]
+
+        hts_code = ai_predict_hts(desc or "", part or "")
         bahamas_tariff = get_bahamas_tariff(hts_code)
-        summary.append({
+
+        summary_rows.append({
             "Invoice": invoice_number,
             "Invoice Date": invoice_date,
             "Line": line_index,
@@ -268,17 +299,14 @@ if uploaded_file:
             "HTS Code": hts_code,
             "Bahamas Tariff Result": bahamas_tariff
         })
-    if summary:
-        df = pd.DataFrame(summary)
+
+    if summary_rows:
+        df = pd.DataFrame(summary_rows)
 
         with st.container():
             st.markdown("<div class='invoice-card'>", unsafe_allow_html=True)
             st.subheader("3. Review & Export Findings")
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
             col_download, col_save = st.columns([1, 1])
             with col_download:
@@ -296,12 +324,12 @@ if uploaded_file:
                     st.session_state.latest_log = combined
 
             if st.session_state.get("save_confirmed"):
-                timestamp = st.session_state.last_saved.strftime("%d %b %Y • %H:%M") if st.session_state.last_saved else ""
+                ts = st.session_state.last_saved.strftime("%d %b %Y • %H:%M") if st.session_state.last_saved else ""
                 st.markdown(
                     f"""
                     <div class='save-banner'>
                         ✅ Results appended to the shared Excel log.<br/>
-                        <span style='font-size:0.9rem;'>Saved {timestamp}. File location: <code>{EXCEL_LOG_PATH}</code></span>
+                        <span style='font-size:0.9rem;'>Saved {ts}. File location: <code>{EXCEL_LOG_PATH}</code></span>
                     </div>
                     """,
                     unsafe_allow_html=True,
@@ -315,9 +343,7 @@ if uploaded_file:
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("### Manual HS Lookups")
-            st.write(
-                "Use the Bahamas Customs tariff search for confirmation and duty rate checks."
-            )
+            st.write("Use the Bahamas Customs tariff search for confirmation and duty rate checks.")
             st.link_button(
                 "Open Bahamas Tariff Search",
                 "https://www.bahamascustoms.gov.bs/tariffs-and-various-taxes-collected-by-customs/tariff-search/",
@@ -335,8 +361,3 @@ if uploaded_file:
 
 st.markdown("---")
 st.caption("For internal customs brokerage use only. Ensure compliance with Bahamas Customs regulations.")
---- a/app.py
-+++ b/app.py
-
-
-
