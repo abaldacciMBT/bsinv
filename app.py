@@ -76,7 +76,7 @@ st.title("Invoice Tariff Workbench")
 st.caption("Internal customs operations tool for Bahamian imports")
 
 # -------------- OpenAI Client / Secrets --------------
-api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", ""))
+api_key = os.getenv("openai_API_key", st.secrets.get("openai_API_key", ""))
 if not api_key:
     st.error("Set your OpenAI key as env var OPENAI_API_KEY or in Streamlit secrets as `openai_api_key`.")
     st.stop()
@@ -361,4 +361,5 @@ if uploaded_file:
 
 st.markdown("---")
 st.caption("For internal customs brokerage use only. Ensure compliance with Bahamas Customs regulations.")
+
 
