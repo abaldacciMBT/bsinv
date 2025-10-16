@@ -8,9 +8,100 @@ import os
 import requests
 from bs4 import BeautifulSoup
 import json
+import re
+from datetime import datetime
 
-st.set_page_config(layout="wide")
-st.title("AI Invoice-to-Bahamas Customs Tariff Analyzer")
+st.set_page_config(
+    page_title="Invoice Tariff Workbench",
+    layout="wide",
+    page_icon="📄",
+)
+
+st.markdown(
+    """
+    <style>
+    :root {
+        --primary-blue: #0F4C81;
+        --soft-blue: #E8F1FA;
+        --text-dark: #0C1E34;
+        --muted-text: #5A6C7D;
+        --panel-border: #C6D3E0;
+    }
+
+    body, .stApp {
+        background-color: var(--soft-blue);
+        color: var(--text-dark);
+        font-family: "Inter", "Segoe UI", sans-serif;
+    }
+
+    .stApp header {display:none;}
+
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2.5rem;
+    }
+
+    .invoice-card {
+        background: white;
+        border-radius: 14px;
+        border: 1px solid var(--panel-border);
+        padding: 2rem 2.25rem;
+        box-shadow: 0 12px 24px rgba(15, 76, 129, 0.06);
+        margin-bottom: 1.5rem;
+    }
+
+    .info-note {
+        background: rgba(15, 76, 129, 0.07);
+        border-left: 4px solid var(--primary-blue);
+        padding: 0.85rem 1.25rem;
+        color: var(--text-dark);
+        border-radius: 0 10px 10px 0;
+        margin-bottom: 1.25rem;
+        font-size: 0.95rem;
+    }
+
+    .metric-card {
+        background: white;
+        border: 1px solid var(--panel-border);
+        border-radius: 12px;
+        padding: 1.1rem 1.3rem;
+        text-align: left;
+        height: 100%;
+    }
+
+    .metric-card h3 {
+        margin: 0;
+        color: var(--muted-text);
+        font-size: 0.85rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+    }
+
+    .metric-card p {
+        margin: 0.25rem 0 0;
+        font-size: 1.4rem;
+        font-weight: 600;
+        color: var(--primary-blue);
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: var(--primary-blue) !important;
+    }
+
+    .save-banner {
+        background: rgba(12, 30, 52, 0.92);
+        color: white;
+        border-radius: 12px;
+        padding: 1rem 1.5rem;
+        margin-top: 1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Invoice Tariff Workbench")
+st.caption("Internal customs operations tool for Bahamian imports")
 
 # Set your OpenAI API key (from environment variable or .streamlit/secrets.toml)
 openai_api_key = os.getenv("OPENAI_API_KEY", st.secrets.get("openai_api_key", ""))
@@ -59,8 +150,11 @@ def ai_predict_hts(description, part_number):
         messages=[{"role": "system", "content": "You are a customs tariff specialist."},
                   {"role": "user", "content": prompt}]
     )
-    # Try to only return the code, strip any extra text
-    return response.choices[0].message.content.strip().split()[0]
+    raw = response.choices[0].message.content.strip()
+    code_match = re.search(r"\b\d{6,10}\b", raw)
+    if code_match:
+        return code_match.group(0)[:6]
+    return raw.split()[0]
 
 def get_bahamas_tariff(hts_code):
     url = f'https://www.bahamascustoms.gov.bs/tariffs-and-various-taxes-collected-by-customs/tariff-search/?q={hts_code}'
@@ -80,13 +174,57 @@ def get_bahamas_tariff(hts_code):
     except Exception as e:
         return f"Error: {str(e)}"
 
-uploaded_file = st.file_uploader("Upload an Invoice PDF", type="pdf")
+EXCEL_LOG_PATH = os.path.join("data", "invoice_tariff_log.xlsx")
+
+if "save_confirmed" not in st.session_state:
+    st.session_state.save_confirmed = False
+    st.session_state.last_saved = None
+
+
+def append_to_excel_log(df: pd.DataFrame, path: str) -> pd.DataFrame:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        existing = pd.read_excel(path)
+        combined = pd.concat([existing, df], ignore_index=True)
+    else:
+        combined = df
+    combined.to_excel(path, index=False)
+    return combined
+
+
+with st.container():
+    st.markdown("<div class='invoice-card'>", unsafe_allow_html=True)
+    st.subheader("1. Upload & Index the Supplier Invoice")
+    st.markdown(
+        """
+        <div class='info-note'>
+        Upload the supplier PDF invoice. We will OCR any scanned pages, extract the line items, and prepare them for tariff
+        classification. Ensure the document clearly shows manufacturer part numbers and product descriptions.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    uploaded_file = st.file_uploader("Select invoice PDF", type="pdf", label_visibility="collapsed")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 if uploaded_file:
     with st.spinner("Extracting text (using OCR if needed)..."):
         pdf_text = extract_text_with_ocr(uploaded_file)
-    st.subheader("Extracted Invoice Text (first 1000 characters):")
-    st.text(pdf_text[:1000] + ("..." if len(pdf_text) > 1000 else ""))
+    with st.expander("Preview extracted text", expanded=False):
+        st.write(pdf_text[:2000] + ("..." if len(pdf_text) > 2000 else ""))
+
+    st.markdown(
+        """
+        <div class='invoice-card'>
+        <h3 style='color: var(--muted-text); letter-spacing:0.08em; text-transform: uppercase;'>2. Line Item Intelligence</h3>
+        <p style='color: var(--text-dark); font-size:0.95rem;'>
+        Line items are parsed and enriched via GPT-4o. Each entry is cross-referenced with the Bahamas Customs tariff search
+        using the suggested HS code.
+        </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.info("Extracting line items and invoice fields using AI (GPT-4o)...")
     invoice_data_json = ai_extract_invoice_data(pdf_text)
@@ -101,6 +239,7 @@ if uploaded_file:
         line_items = []
 
     summary = []
+    invoice_number_tracker = {}
     for item in line_items:
         desc = item.get("description", "")
         part = item.get("item/manufacturer part number", "")
@@ -108,9 +247,18 @@ if uploaded_file:
         qty = item.get("quantity", "")
         price = item.get("price", "")
         ext_price = item.get("extended price", "")
+        invoice_number = item.get("invoice number", item.get("invoice", ""))
+        invoice_date = item.get("invoice date", "")
+        invoice_key = (invoice_number, invoice_date)
+        invoice_number_tracker.setdefault(invoice_key, 0)
+        invoice_number_tracker[invoice_key] += 1
+        line_index = invoice_number_tracker[invoice_key]
         hts_code = ai_predict_hts(desc, part)
         bahamas_tariff = get_bahamas_tariff(hts_code)
         summary.append({
+            "Invoice": invoice_number,
+            "Invoice Date": invoice_date,
+            "Line": line_index,
             "Description": desc,
             "Part Number": part,
             "Brand": brand,
@@ -122,11 +270,68 @@ if uploaded_file:
         })
     if summary:
         df = pd.DataFrame(summary)
-        st.subheader("Summary Table")
-        st.dataframe(df)
-        st.download_button("Download as CSV", df.to_csv(index=False), "summary.csv")
+
+        with st.container():
+            st.markdown("<div class='invoice-card'>", unsafe_allow_html=True)
+            st.subheader("3. Review & Export Findings")
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            col_download, col_save = st.columns([1, 1])
+            with col_download:
+                st.download_button(
+                    "Download as CSV",
+                    df.to_csv(index=False),
+                    "invoice_tariff_summary.csv",
+                    type="primary",
+                )
+            with col_save:
+                if st.button("Append to internal Excel log", type="secondary"):
+                    combined = append_to_excel_log(df, EXCEL_LOG_PATH)
+                    st.session_state.save_confirmed = True
+                    st.session_state.last_saved = datetime.now()
+                    st.session_state.latest_log = combined
+
+            if st.session_state.get("save_confirmed"):
+                timestamp = st.session_state.last_saved.strftime("%d %b %Y • %H:%M") if st.session_state.last_saved else ""
+                st.markdown(
+                    f"""
+                    <div class='save-banner'>
+                        ✅ Results appended to the shared Excel log.<br/>
+                        <span style='font-size:0.9rem;'>Saved {timestamp}. File location: <code>{EXCEL_LOG_PATH}</code></span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                with st.expander("View aggregated Excel log", expanded=False):
+                    log_df = st.session_state.get("latest_log")
+                    if log_df is not None:
+                        st.dataframe(log_df, use_container_width=True, hide_index=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("### Manual HS Lookups")
+            st.write(
+                "Use the Bahamas Customs tariff search for confirmation and duty rate checks."
+            )
+            st.link_button(
+                "Open Bahamas Tariff Search",
+                "https://www.bahamascustoms.gov.bs/tariffs-and-various-taxes-collected-by-customs/tariff-search/",
+                type="primary",
+            )
+        with col2:
+            st.markdown("### Research Tips")
+            st.markdown(
+                "- Validate descriptions using manufacturer websites.\n"
+                "- Cross-check HS codes with recent rulings.\n"
+                "- Capture duty rate notes in the Excel log after review."
+            )
     else:
         st.warning("No line items found. Please check your invoice or try another file.")
 
 st.markdown("---")
-st.caption("Created by ChatGPT – For production, ask for authentication & more features!")
+st.caption("For internal customs brokerage use only. Ensure compliance with Bahamas Customs regulations.")
