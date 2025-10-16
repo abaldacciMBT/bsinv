@@ -335,8 +335,6 @@ if uploaded_file:
 
 st.markdown("---")
 st.caption("For internal customs brokerage use only. Ensure compliance with Bahamas Customs regulations.")
-diff --git a/app.py b/app.py
-index 03ec84c2f961179a527758cca2800cc02300ac02..30d3c846fd960f529f39c0575bcf7c1be0c7c0b9 100644
 --- a/app.py
 +++ b/app.py
 @@ -1,132 +1,337 @@
@@ -732,3 +730,4 @@ index 03ec84c2f961179a527758cca2800cc02300ac02..30d3c846fd960f529f39c0575bcf7c1b
 +
 +st.markdown("---")
 +st.caption("For internal customs brokerage use only. Ensure compliance with Bahamas Customs regulations.")
+
